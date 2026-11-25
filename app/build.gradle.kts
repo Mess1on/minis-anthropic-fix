@@ -10,8 +10,8 @@ android {
         applicationId = "com.ktwo.minisa"
         minSdk = 26
         targetSdk = 34
-        versionCode = 6
-        versionName = "6.0.0"
+        versionCode = 10
+        versionName = "1.0.0"
     }
 
     // 本地放了 app/minisa.jks 就用它签名（自用升级不用卸载）；
