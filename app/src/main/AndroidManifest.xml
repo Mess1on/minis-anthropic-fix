@@ -11,13 +11,10 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="给 Minis 的 Anthropic 请求补上 x-opencode-session 头，使 OpenCode Go 的 /v1/messages 可直接使用（无需反代）。" />
+            android:value="给 Minis 的 Anthropic 请求补 x-opencode-session 头并转换 Bearer 为 x-api-key（Modern API 102）" />
         <meta-data
             android:name="xposedminversion"
-            android:value="93" />
-        <meta-data
-            android:name="xposedscope"
-            android:resource="@array/xposed_scope" />
+            android:value="102" />
     </application>
 
 </manifest>
