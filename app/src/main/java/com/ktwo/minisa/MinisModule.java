@@ -8,15 +8,15 @@ import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam;
 
 /**
- * Modern Xposed API (libxposed API 102) 实现。
+ * Modern Xposed API (libxposed API 102)。
  *
- * 给 Minis 发往 OpenCode Go 的 Anthropic 请求补两个东西：
- *   1. x-opencode-session 头（OpenCode 的路由要求）
- *   2. 把 Authorization: Bearer 转成 x-api-key（Minis 对 custom endpoint 用前者，
- *      OpenCode 的 /v1/messages 只认后者）
+ * Hook 点：okhttp3.OkHttpClient.newCall(Request)
+ *   — Request$Builder.build() 在 Minis 的 dex 里找不到（被 R8 优化/内联），
+ *     改用 newCall：所有出站请求都必须经过它，且是 public API 入口，不会被内联。
  *
- * Hook 点：okhttp3.Request$Builder.build()
- *   OkHttp 是第三方库，Minis 未重定位（dex 中确认 Lokhttp3/Request$Builder; 存在）
+ * 做两件事：
+ *   1. 补 x-opencode-session 头
+ *   2. 把 Authorization: Bearer 转成 x-api-key
  */
 public class MinisModule extends XposedModule {
 
@@ -28,69 +28,103 @@ public class MinisModule extends XposedModule {
     @Override
     public void onPackageLoaded(PackageLoadedParam param) {
         if (!TARGET_PKG.equals(param.getPackageName())) return;
-
         log(Log.INFO, TAG, "onPackageLoaded: " + param.getPackageName());
 
+        ClassLoader cl = param.getDefaultClassLoader();
+
+        // 诊断：把 Request$Builder 的方法名打出来
         try {
-            ClassLoader cl = param.getDefaultClassLoader();
             Class<?> builderCls = cl.loadClass("okhttp3.Request$Builder");
-            Method buildMethod = builderCls.getDeclaredMethod("build");
-            buildMethod.setAccessible(true);
+            StringBuilder sb = new StringBuilder();
+            for (Method m : builderCls.getDeclaredMethods()) {
+                if (m.getName().equals("build") || m.getName().equals("header")) {
+                    sb.append(m.getName()).append("(");
+                    for (Class<?> p : m.getParameterTypes()) sb.append(p.getSimpleName()).append(",");
+                    sb.append(") ");
+                }
+            }
+            log(Log.INFO, TAG, "builder methods: " + sb);
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "probe builder failed: " + t);
+        }
 
-            hook(buildMethod).intercept(chain -> {
-                Object req = chain.proceed();
-                if (req == null) return null;
+        // 主 hook：OkHttpClient.newCall(Request)
+        try {
+            Class<?> clientCls = cl.loadClass("okhttp3.OkHttpClient");
+            Class<?> reqCls = cl.loadClass("okhttp3.Request");
+            Method newCall = clientCls.getDeclaredMethod("newCall", reqCls);
+            newCall.setAccessible(true);
 
-                try {
-                    Class<?> reqCls = req.getClass();
-                    Method urlM = reqCls.getMethod("url");
-                    Object urlObj = urlM.invoke(req);
-                    String url = String.valueOf(urlObj);
+            hook(newCall).intercept(chain -> {
+                Object req = chain.getArg(0);
+                Object rebuilt = inject(req);
+                if (rebuilt != req) {
+                    return chain.proceed(new Object[]{rebuilt});
+                }
+                return chain.proceed();
+            });
+            log(Log.INFO, TAG, "hooked OkHttpClient.newCall");
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "newCall hook failed: " + t);
+            // 兜底：试 build()
+            try {
+                Class<?> builderCls = cl.loadClass("okhttp3.Request$Builder");
+                Method build = builderCls.getDeclaredMethod("build");
+                build.setAccessible(true);
+                hook(build).intercept(chain -> {
+                    Object req = chain.proceed();
+                    Object rebuilt = inject(req);
+                    return rebuilt != req ? rebuilt : req;
+                });
+                log(Log.INFO, TAG, "fallback: hooked Request$Builder.build");
+            } catch (Throwable t2) {
+                log(Log.ERROR, TAG, "build fallback failed: " + t2);
+            }
+        }
+    }
 
-                    if (!url.contains("opencode.ai")) return req;
-                    if (!url.contains("/zen/go/v1/messages")) return req;
+    /** 按需重建 Request（加 header / 换鉴权字段），不满足条件时原样返回。 */
+    private Object inject(Object req) {
+        if (req == null) return null;
+        try {
+            Class<?> reqCls = req.getClass();
+            Method urlM = reqCls.getMethod("url");
+            String url = String.valueOf(urlM.invoke(req));
 
-                    Method headerM = reqCls.getMethod("header", String.class);
+            if (!url.contains("opencode.ai")) return req;
+            if (!url.contains("/zen/go/v1/messages")) return req;
 
-                    // 已经补过就跳过（避免 newBuilder().build() 递归）
-                    Object existing = headerM.invoke(req, SESSION_HEADER);
-                    if (existing != null) return req;
+            Method headerM = reqCls.getMethod("header", String.class);
+            Object existing = headerM.invoke(req, SESSION_HEADER);
+            if (existing != null) return req;
 
-                    Method newBuilderM = reqCls.getMethod("newBuilder");
-                    Object nb = newBuilderM.invoke(req);
-                    Class<?> nbCls = nb.getClass();
-                    Method setHeaderM = nbCls.getMethod("header", String.class, String.class);
+            Object nb = reqCls.getMethod("newBuilder").invoke(req);
+            Class<?> nbCls = nb.getClass();
+            Method setHeaderM = nbCls.getMethod("header", String.class, String.class);
 
-                    setHeaderM.invoke(nb, SESSION_HEADER, SESSION_VALUE);
+            setHeaderM.invoke(nb, SESSION_HEADER, SESSION_VALUE);
 
-                    // Bearer -> x-api-key
-                    Object xKey = headerM.invoke(req, "x-api-key");
-                    if (xKey == null) {
-                        Object auth = headerM.invoke(req, "Authorization");
-                        if (auth instanceof String) {
-                            String a = (String) auth;
-                            if (a.regionMatches(true, 0, "Bearer ", 0, 7)) {
-                                String key = a.substring(7).trim();
-                                if (!key.isEmpty()) {
-                                    setHeaderM.invoke(nb, "x-api-key", key);
-                                    log(Log.INFO, TAG, "converted Bearer -> x-api-key (" + key.length() + " chars)");
-                                }
-                            }
+            Object xKey = headerM.invoke(req, "x-api-key");
+            if (xKey == null) {
+                Object auth = headerM.invoke(req, "Authorization");
+                if (auth instanceof String) {
+                    String a = (String) auth;
+                    if (a.regionMatches(true, 0, "Bearer ", 0, 7)) {
+                        String key = a.substring(7).trim();
+                        if (!key.isEmpty()) {
+                            setHeaderM.invoke(nb, "x-api-key", key);
+                            log(Log.INFO, TAG, "converted Bearer -> x-api-key (" + key.length() + " chars)");
                         }
                     }
-
-                    Object rebuilt = nbCls.getMethod("build").invoke(nb);
-                    log(Log.INFO, TAG, "injected " + SESSION_HEADER + " -> " + url);
-                    return rebuilt;
-                } catch (Throwable t) {
-                    log(Log.WARN, TAG, "hook body error: " + t);
-                    return req;
                 }
-            });
+            }
 
-            log(Log.INFO, TAG, "request hook installed");
+            Object rebuilt = nbCls.getMethod("build").invoke(nb);
+            log(Log.INFO, TAG, "injected " + SESSION_HEADER + " -> " + url);
+            return rebuilt;
         } catch (Throwable t) {
-            log(Log.ERROR, TAG, "install failed: " + t);
+            log(Log.WARN, TAG, "inject error: " + t);
+            return req;
         }
     }
 }
