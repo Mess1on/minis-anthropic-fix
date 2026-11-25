@@ -51,7 +51,27 @@ public class Hook implements IXposedHookLoadPackage {
                         if (!s.contains("/zen/go/v1/messages")) return;
 
                         Object nb = XposedHelpers.callMethod(req, "newBuilder");
+                        // 1) OpenCode 要求的会话路由头
                         XposedHelpers.callMethod(nb, "header", SESSION_HEADER, SESSION_VALUE);
+
+                        // 2) Minis 对 custom endpoint 发 Authorization: Bearer，
+                        //    OpenCode 的 Anthropic 端点只认 x-api-key，这里补齐。
+                        Object existingKey = XposedHelpers.callMethod(req, "header", "x-api-key");
+                        if (existingKey == null) {
+                            Object auth = XposedHelpers.callMethod(req, "header", "Authorization");
+                            if (auth instanceof String) {
+                                String a = (String) auth;
+                                if (a.regionMatches(true, 0, "Bearer ", 0, 7)) {
+                                    String key = a.substring(7).trim();
+                                    if (!key.isEmpty()) {
+                                        XposedHelpers.callMethod(nb, "header", "x-api-key", key);
+                                        XposedBridge.log("[MinisA] converted Bearer -> x-api-key ("
+                                                + key.length() + " chars)");
+                                    }
+                                }
+                            }
+                        }
+
                         Object rebuilt = XposedHelpers.callMethod(nb, "build");
                         param.setResult(rebuilt);
 
