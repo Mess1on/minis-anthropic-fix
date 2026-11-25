@@ -10,14 +10,23 @@ android {
         applicationId = "com.ktwo.minisa"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0.0"
+        versionCode = 3
+        versionName = "3.0.0"
+    }
+
+    signingConfigs {
+        create("fixed") {
+            storeFile = file("minisa.jks")
+            storePassword = "minisa2026"
+            keyAlias = "minisa"
+            keyPassword = "minisa2026"
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("fixed")
         }
     }
 
@@ -27,7 +36,6 @@ android {
     }
 
     packaging {
-        // Modern API 的入口清单在 META-INF/xposed/ 下，必须打进 APK
         resources {
             merges += "META-INF/xposed/*"
             excludes += setOf("META-INF/*.kotlin_module", "META-INF/DEPENDENCIES")
